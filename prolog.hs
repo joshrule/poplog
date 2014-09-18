@@ -1,239 +1,170 @@
 module Main where
 
-import Control.Monad
-import Control.Applicative hiding ((<|>), many)
-import Data.List (intersperse, delete)
+-- external imports
+import Control.Monad.Except
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Logic
+import Control.Monad.State.Lazy
+import Data.Char
+import Data.List (findIndices)
+import qualified Data.Map as M
+import Data.Maybe
 import System.Environment
-import Text.ParserCombinators.Parsec hiding (spaces)
+import System.IO
+import Text.ParserCombinators.Parsec hiding (State)
 
--- Terms
+-- internal imports
+import PrologParser
+import PrologTypes
 
-{- http://fsl.cs.illinois.edu/images/9/9c/PrologStandard.pdf
+-- Errors
 
-Strings:
-    - 'char' % as atoms
-    - \[{[char],}+\] % a list of single character atoms
-    - "[char]+" % a list of character codes
+data PError = Default String
+            | Parser ParseError
+instance Show PError where show = showError
+showError :: PError -> String
+showError (Default s) = s
+showError (Parser p) = show p
+-- Monads
 
-Lists
-    - [] is the empty list
-    - | can be placed once anywhere in a list to separate head from tail
-    - curly brackets for definite clause grammars (to add later if needed)
+type PStateM = StateT [Clause] IO
+type PErrorM = ExceptT PError PStateM
 
-Parentheses:
-    - allowed anywhere, they override grouping.
-    - Operators in parentheses do not operate (e.g. 2(+)2 is an error).
+-- Evaluation
 
-Conjunction: ,
+eval :: Clause -> PErrorM Clause
+eval val@(Rule _ _) = lift get >>= (\e -> lift $ put (val:e)) >> return val
+eval val@(Query q) = (observeT $ resolve q (Just [])) >>= myShow
 
-Disjunction: ;
+myShow :: UEnv -> PErrorM Clause
+myShow Nothing = return (Rule (Atom "fail") (Atom "true"))
+myShow (Just xs) = do
+    subs <- mapM toTerm $ reverse xs
+    let body = foldl (\acc x -> (Structure "." [x,acc])) (Atom "[]") subs
+    return $ (Rule (Atom "substitutions") body)
 
-Success: true
+toTerm :: (Term,Term) -> PErrorM Term
+toTerm (a@(Variable _ _),b) = return (Structure "sub" [a, b])
+toTerm _ = throwError $ Default "broken environment"
 
-Failure: fail
+-- Resolution
+type UEnv = Maybe [(Term, Term)]
 
-Cuts: !
-
-If-Then-Else: (A -> B ; C), where "; C" is optional
-
-Arithmetic:
-    - X is Y, where Y is an arithmetic expression
-    - op(X,Y) where X and Y may arithmetic expressions and op \in =:=, =\=, <, >,
-      =<, >=
-
-Unification:
-    - =, unify
-    - unify_with_occurs_check, unify with occurs check
-    - \=, cannot unify
--}
-
-type Name = String
-
-data Term = Structure Name [Term] -- technically should be "atom", not name
-          | Atom Name
-          | Real Double
-          | Integer Int
-          | Variable Name
-instance Show Term where show = showTerm
-
-showTerm :: Term -> String
-showTerm (Atom a) = a
-showTerm (Real r) = show r
-showTerm (Integer i) = show i
-showTerm (Variable v) = v
-showTerm (Structure f ts) = f ++ "(" ++ showSepList ", " ts ++ ")"
-
--- Clauses
-
-data Clause = Fact Term
-            | Rule Term [Term]
-            | Query Term
-instance Show Clause where show = showClause
-                           
-showClause (Fact t) = show t ++ "."
-showClause (Rule t ts) = show t ++ " :- " ++ showSepList ", " ts ++ "."
-showClause (Query t) = show t ++ "."
-
-showSepList :: Show x => String -> [x] -> String
-showSepList sep xs = concat $ intersperse sep (map show xs)
-
--- Parser Helpers
-
-(<++>) a b = (++) <$> a <*> b
-(<:>) a b = (:) <$> a <*> b
-
-spaces :: Parser ()
-spaces = skipMany space
-
-spaces1 :: Parser ()
-spaces1 = skipMany1 space
-
-unsignedInt :: Parser String
-unsignedInt = many1 digit
-
-signedInt :: Parser String
-signedInt = plus <|> minus
+resolve :: Term -> UEnv -> LogicT PErrorM UEnv
+resolve (Atom "true") env = return env -- what is it?
+resolve (Atom "fail") env = return Nothing
+resolve (Structure ";" [o1,o2]) env = interleave (resolve o1 env) (resolve o2 env)
+resolve (Structure "," [o1,o2]) env = (resolve o1 env) >>- (resolve o2)
+-- Make a list of rules whose heads unify with t, reform as a disjunction
+-- of the antecedents and attempt to resolve it.
+resolve t env = do
+    db <- lift $ lift get
+    resolveList (possibleUnifiers t db)
   where
-    plus = char '+' *> unsignedInt
-    minus = (char '-') <:> unsignedInt
+    resolveList ((t,e):rest) = interleave (resolve t e) (resolveList rest)
+    resolveList [] = mzero
+    possibleUnifiers t db = zip [ (dbAntecedents db) !! x | x <- (survivingIndices t db)]
+                                [ (unifyEnvs t db)   !! x | x <- (survivingIndices t db)]
+    unifyEnvs t db = map (flip (topLevelUnifier t) env) (dbHeads db)-- extract heads?
+    dbAntecedents db = map (\(Rule h b) -> b) db
+    dbHeads db = map (\(Rule h b) -> h) db
+    survivingIndices t db = findIndices isJust $ unifyEnvs t db
 
-integer :: Parser String
-integer = signedInt <|> unsignedInt
-
-double :: Parser String
-double = integer <++> mantissa <++> exponent
+-- Unification based on Russell & Norvig's Unifier (Figure 9.1)
+-- rename vars across terms, including underscores
+topLevelUnifier :: Term -> Term -> UEnv -> UEnv
+topLevelUnifier t1 t2 env =
+    unify (evalState (rename t1 getMax) (getMax+2)) (evalState (rename t2 (getMax+1)) (getMin-1)) env
   where
-    mantissa = option "" $ char  '.'  <:> unsignedInt
-    exponent = option "" $ oneOf "eE" <:> integer
+    getMax = foldl (\acc x -> if x>acc then x else acc) 0 $ map fromJust $ filter isJust $ map varVals $ fromJust env
+    getMin = foldl (\acc x -> if x<acc then x else acc) 0 $ map fromJust $ filter isJust $ map varVals $ fromJust env
+    varVals ((Variable _ i),_) = Just i
+    varVals _         = Nothing
+    rename :: Term -> Int -> State Int Term
+    rename r@(Real _) n1 = return r
+    rename a@(Atom _) n1 = return a
+    rename i@(Integer _) n1 = return i
+    rename (Variable s i) n1 = do
+      n2 <- get
+      if s == "_"
+      then do put (if n2 < 0 then (n2-1) else (n2+1)) >> return (Variable s n2)
+      else return (Variable s n1)
+    rename s@(Structure h b) n1 = liftM (Structure h) (mapM (\x -> rename x n1) b)
 
--- TODO: is this a hack?
-parseInt :: Parser Term
-parseInt = liftM Integer $ rd <$> (integer <* notFollowedBy (oneOf ".eE"))
-  where
-    rd = read :: String -> Int
+unify :: Term -> Term -> UEnv -> UEnv
+unify (Atom a1) (Atom a2) env = if a1 == a2 then env else Nothing
+unify (Real r1) (Real r2) env = if r1 == r2 then env else Nothing
+unify (Integer n1) (Integer n2) env = if n1 == n2 then env else Nothing
 
-parseDouble :: Parser Term
-parseDouble = liftM Real $ rd <$> double
-  where rd = read :: String -> Double
+unify v1@(Variable _ _) x env = unifyVar v1 x env
+unify x v1@(Variable _ _) env = unifyVar v1 x env
+unify (Structure f1 b1) (Structure f2 b2) env =
+    foldl (\acc (x1,x2) -> unify x1 x2 acc) (unify (Atom f1) (Atom f2) env) (zip b1 b2)
+unify _ _ _ = Nothing
 
-parseNumber :: Parser Term
-parseNumber = try parseInt <|> parseDouble
-
-parseBareAtom :: Parser Term
-parseBareAtom = liftM Atom $ atom
-  where atom = lower <:> many (alphaNum <|> char '_')
-
--- broken: need to fix the fact that single-quote \in anyChar
-parseQuotedAtom :: Parser Term
-parseQuotedAtom = liftM Atom $ atom
-  where
-    atom = quote *> escapedString <* quote
-    quote = char '\''
-    escapedString = many (try (string "''" >> return '\'') <|> noneOf "'")
-
-parseGraphicToken :: Parser Term
-parseGraphicToken = liftM Atom $ atom
-  where atom = try twoPlus <|> ((:[]) <$> oneOf gChars)
-        twoPlus = try (char '/' <:> ((oneOf (delete '*' gChars)) <:> theRest))
-                  <|> (oneOf (delete '/' gChars) <:> (oneOf gChars <:> theRest))
-        theRest = many $ oneOf gChars
-        gChars = "#$&*+-./:<=>?@^~\\"
-
-parseEmptyList :: Parser Term
-parseEmptyList = char '[' >> spaces >> char ']' >> (return (Atom "[]"))
-
-parseEmptyBracket :: Parser Term
-parseEmptyBracket = char '{' >> spaces >> char '}' >> (return (Atom "{}"))
-
-parseAtom :: Parser Term
-parseAtom =  try parseBareAtom
-         <|> try parseQuotedAtom
-         <|> try parseGraphicToken
-         <|> try parseEmptyList
-         <|> try parseEmptyBracket
-
-parseVariable :: Parser Term
-parseVariable = liftM Variable var
-  where var = (letter <|> char '_') <:> many (alphaNum <|> char '_')
-
--- We need two of these, because sometimes a compound term can have variables
--- and sometimes it must be completely instantiated, as in a fact.
-parseStructure :: Parser Term
-parseStructure = do
-  (Atom functor) <- parseAtom <* (char '(' >> spaces)
-  args <- sepBy parseTerm (char ',') <* char ')'
-  return $ Structure functor args
-
-parseVarFreeStructure :: Parser Term
-parseVarFreeStructure = do
-  (Atom functor) <- parseAtom <* (char '(' >> spaces)
-  args <- sepBy parseVarFreeTerm (char ',') <* char ')'
-  return $ Structure functor args
-
-parseTerm :: Parser Term
-parseTerm = spaces *> term <* spaces
-  where term =  try parseStructure
-            <|> try parseAtom
-            <|> try parseVariable
-            <|> parseNumber
-
-parseVarFreeTerm :: Parser Term
-parseVarFreeTerm = spaces *> term <* spaces
-  where term =  try parseVarFreeStructure
-            <|> try parseAtom
-            <|> parseNumber
-
---- Facts are just variable-free compound terms
-parseFact = liftM ((:[]) . Fact) (spaces *> parseVarFreeStructure <* (spaces >> char '.'))
-
--- a single rule statement  potentially lists several rules,
--- one for each conjunctive clause between semi-colons.
-parseRule = do
-  spaces
-  head <- parseStructure
-  spaces >> string ":-" >> spaces
-  bodies <- parseBodies
-  spaces >> char '.'
-  return $ map (Rule head) bodies
-
-parseBodies = do
-  sepBy parseBody (spaces >> char ';' >> spaces)
-
-parseBody = do
-  sepBy parseStructure (spaces >> char ',' >> spaces)
-
--- Queries are just compound terms, maybe with variables.
-parseQuery = do
-  spaces >> string "?-" >> spaces
-  query <- parseStructure
-  spaces >> char '.'
-  return [ (Query query) ]
-
-parseExpr =  try parseRule
-         <|> try parseQuery
-         <|> parseFact
-
-parseExprs = endBy parseExpr eol
-
-eol =  try (string "\n\r")
-   <|> try (string "\r\n")
-   <|> string "\n"
-   <|> string "\r"
-   <?> "End of line"
+-- No Occur-Check!
+unifyVar :: Term -> Term -> UEnv -> UEnv
+unifyVar v@(Variable _ _) x j@(Just env) =
+  maybe (maybe (maybe Nothing
+                      (\e -> Just $ (v,x):e)
+                      j)
+               (\val -> unify v val (Just env))
+               (lookup x env))
+        (\val -> unify val x (Just env))
+        (lookup v env)
+unifyVar _ _ _ = Nothing
 
 -- main
 
--- readInput :: String -> String
--- readInput input = case parse parseExprs "prolog" input of
---   Left err -> "Error " ++ show err
---   Right val -> "Found " -- ++ show val
--- 
--- main :: IO ()
--- main = do
---   args <- getArgs
---   putStrLn $ readInput $ args !! 0
+trapError :: PErrorM String -> PErrorM String
+trapError action = catchError action (return . show)
+
+extractValue :: PErrorM a -> PStateM a
+extractValue result = do
+   result' <- (runExceptT result)
+   case result' of 
+     (Right val) -> return val
+
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+readInput :: String -> PErrorM Clause
+readInput input = case parseProlog input of
+  Left err -> throwError $ Parser err
+  Right val -> eval val
+
+readPrompt :: String -> PStateM String
+readPrompt prompt = liftIO $ flushStr prompt >> liftIO getLine
+
+evalString :: String -> PStateM String
+evalString expr = extractValue $ trapError $ liftM  show $ readInput expr
+
+evalAndPrint :: String -> PStateM ()
+evalAndPrint expr = do
+  str <- evalString expr
+  (liftIO $ putStrLn str)
+
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pred prompt action = do
+  result <- prompt
+  if pred result
+    then return ()
+    else action result >> until_ pred prompt action
+
+runOne :: String -> IO ()
+runOne filename = do
+  str <- readFile filename
+  let strs = lines str
+  evalStateT (mapM evalAndPrint strs) []
+  return ()
+
+runRepl :: IO ()
+runRepl = evalStateT (until_ (== "quit") (readPrompt ">> ") (evalAndPrint)) []
 
 main :: IO ()
-main = forever $ do putStrLn "Enter a number: "
-                    input <- getLine
-                    parseTest parseExpr input
+main = do 
+    args <- getArgs
+    case length args of
+      0 -> runRepl
+      1 -> runOne $ args !! 0
+      otherwise -> putStrLn "Error: pl takes 0 or 1 argument."
