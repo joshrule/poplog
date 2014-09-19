@@ -1,43 +1,13 @@
-module PrologParser where
+module Poplog.Parser where
 
 -- external imports
 import Control.Monad
 import Control.Applicative hiding ((<|>), many)
 import Data.List (intersperse, delete)
-import System.Environment
 import Text.ParserCombinators.Parsec hiding (spaces)
 
 -- internal imports
-import PrologTypes
-
-{- adapted from http://fsl.cs.illinois.edu/images/9/9c/PrologStandard.pdf
-
-Strings:
-    - 'char' % as atoms
-    - \[{[char],}+\] % a list of single character atoms
-    - "[char]+" % a list of character codes
-
-Lists
-    - [] is the empty list
-    - | can be placed once anywhere in a list to separate head from tail
-    - curly brackets for definite clause grammars (to add later if needed)
-
-Parentheses:
-    - allowed anywhere, they override grouping.
-    - Operators in parentheses do not operate (e.g. 2(+)2 is an error).
-
-If-Then-Else: (A -> B ; C), where "; C" is optional
-
-Arithmetic:
-    - X is Y, where Y is an arithmetic expression
-    - op(X,Y) where X and Y may arithmetic expressions and op \in =:=, =\=, <, >,
-      =<, >=
-
-Unification:
-    - =, unify
-    - unify_with_occurs_check, unify with occurs check
-    - \=, cannot unify
--}
+import Poplog.Types
 
 -- Helper Functions
 
@@ -119,31 +89,53 @@ parseGraphicToken = liftM Atom $ atom
                   <|> (oneOf (delete '/' gChars) <:> (oneOf gChars <:> theRest))
         theRest = many $ oneOf gChars
         gChars = "#$&*+-./:<=>?@^~\\"
-
-parseEmptyList :: Parser Term
-parseEmptyList = char '[' >> spaces >> char ']' >> (return (Atom "[]"))
-
-parseEmptyBracket :: Parser Term
-parseEmptyBracket = char '{' >> spaces >> char '}' >> (return (Atom "{}"))
-
 parseAtom :: Parser Term
 parseAtom =  try parseBareAtom
          <|> try parseQuotedAtom
          <|> try parseGraphicToken
-         <|> try parseEmptyList
-         <|> try parseEmptyBracket
 
 parseVariable :: Parser Term
 parseVariable = liftM (flip Variable $ 0) var
   where var = (letter <|> char '_') <:> many (alphaNum <|> char '_')
 
+parseHeadedList :: Parser Term
+parseHeadedList = do
+    char '[' >> spaces
+    heads <- sepBy parseTerm (spaces >> char ',' >> spaces)
+    spaces >> char '|' >> spaces
+    tail <- (try parseList <|> parseVariable)
+    spaces >> char ']'
+    return $ makeList heads tail
+
+parseList :: Parser Term
+parseList = do
+    char '[' >> spaces
+    xs <- sepBy parseTerm (spaces >> char ',' >> spaces)
+    spaces >> char ']'
+    return $ makeList xs (Structure "[]" [])
+
+makeList :: [Term] -> Term -> Term
+makeList [] tail = tail
+makeList (x:xs) tail = (Structure "." [x,(makeList xs tail)])
+
+parseEmptyList :: Parser Term
+parseEmptyList = char '[' >> spaces >> char ']' >> (return (Structure "[]" []))
+
+parseEmptyBracket :: Parser Term
+parseEmptyBracket = char '{' >> spaces >> char '}' >> (return (Structure "{}" []))
+
 -- We need two of these, because sometimes a compound term can have variables
 -- and sometimes it must be completely instantiated, as in a fact.
 parseStructure :: Parser Term
-parseStructure = do
-  (Atom functor) <- parseAtom <* (char '(' >> spaces)
-  args <- sepBy parseTerm (char ',') <* char ')'
-  return $ Structure functor args
+parseStructure =
+  do
+    (Atom functor) <- parseAtom <* (char '(' >> spaces)
+    args <- sepBy parseTerm (char ',') <* char ')'
+    return $ Structure functor args
+  <|> try parseHeadedList
+  <|> try parseList
+  <|> try parseEmptyList
+  <|> try parseEmptyBracket
 
 parseVarFreeStructure :: Parser Term
 parseVarFreeStructure = do
@@ -165,7 +157,7 @@ parseVarFreeTerm = spaces *> term <* spaces
             <|> parseNumber
 
 --- Facts are just variable-free compound terms
-parseFact = liftM (\x -> Rule x (Atom "true")) (spaces *> parseVarFreeStructure <* (spaces >> char '.'))
+parseFact = liftM (\x -> Rule x (Atom "true")) (spaces *> parseStructure <* (spaces >> char '.'))
 
 -- a single rule statement  potentially lists several rules,
 -- one for each conjunctive clause between semi-colons.

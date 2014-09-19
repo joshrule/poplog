@@ -1,0 +1,17 @@
+# POPLOG
+
+Poplog is an implementation of a prolog-style language lacking functions.
+It has numbers, atoms, variables, and predicates, but it has no functions
+as would be needed to evaluate say "X is 5+7."
+
+# Installation
+
+```
+git clone https://github.com/joshrule/poplog.git  # clone the repository
+cd poplog                                         # cd into the directory
+cabal sandbox init                                # initialize sandbox
+cabal install                                     # install the package
+cabal repl                                        # launch ghci
+ghci> :load src/examples/Main.hs                  # import the example repl
+ghci> :main                                       # run the example
+```

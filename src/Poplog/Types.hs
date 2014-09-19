@@ -1,7 +1,10 @@
-module PrologTypes
+module Poplog.Types
        ( Name(..)
        , Term(..)
        , Clause(..)
+       , PError(..)
+       , PErrorM(..)
+       , PStateM(..)
        , isAtom
        , isStructure
        , isReal
@@ -11,6 +14,8 @@ module PrologTypes
 
 -- external imports
 import Data.List (intersperse)
+import Control.Monad.Except
+import Control.Monad.State.Lazy
 
 -- helper functions
 
@@ -34,7 +39,16 @@ showTerm (Atom a) = a
 showTerm (Real r) = show r
 showTerm (Integer i) = show i
 showTerm (Variable v i) = v ++ ":" ++ show i
+showTerm (Structure "[]" []) = "[]"
+showTerm (Structure "." xs) = "[" ++ (showListTerm xs) ++ "]"
+showTerm (Structure "," [a,b]) = show a ++ ", " ++ show b
+showTerm (Structure ";" [a,b]) = show a ++ "; " ++ show b
 showTerm (Structure f ts) = f ++ "(" ++ showSepList ", " ts ++ ")"
+
+showListTerm :: [Term] -> String
+showListTerm [h,(Structure "[]" [])] = show h
+showListTerm [h,(Structure "." tail)] = show h ++ ", " ++ showListTerm tail
+showListTerm [h,t] = show h ++ " | " ++ show t
 
 compareTerm (Atom a) (Atom b) = a == b
 compareTerm (Real r) (Real s) = r == s
@@ -62,6 +76,19 @@ isVariable _            = False
 
 data Clause = Rule Term Term | Query Term
 instance Show Clause where show = showClause
-                           
+
+showClause (Rule t (Atom "true")) = show t ++ "."
 showClause (Rule t ts) = show t ++ " :- " ++ show ts ++ "."
 showClause (Query t) = show t ++ "."
+
+-- Errors
+
+data PError = PError String
+instance Show PError where show = showError
+showError :: PError -> String
+showError (PError s) = s
+
+-- Monads
+
+type PStateM = StateT [Clause] IO
+type PErrorM = ExceptT PError PStateM
